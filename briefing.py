@@ -176,4 +176,132 @@ def get_weekly_calendar():
                 continue
             if key not in by_day:
                 by_day[key] = []
-            
+            fire   = " \U0001f525" if impact == "high" else ""
+            detail = ""
+            if e.get("forecast"):
+                detail += "  Fcst: " + str(e["forecast"])
+            if e.get("previous"):
+                detail += "  Prev: " + str(e["previous"])
+            by_day[key].append(e.get("title", "Unknown") + fire + detail)
+        return by_day
+    except Exception:
+        return {}
+
+
+def get_groq_analysis(prices, fg_value, fg_label, macro, macro_news, crypto_news,
+                      poly, btc_dom, funding_rate, ls_ratio):
+    price_lines = []
+    for coin_id, symbol in CRYPTO_WATCHLIST.items():
+        d  = prices.get(coin_id, {})
+        p  = d.get("usd", "N/A")
+        c  = d.get("usd_24h_change", None)
+        cs = ("+{:.2f}%".format(c) if c >= 0 else "{:.2f}%".format(c)) if c is not None else "N/A"
+        ps = "${:,.2f}".format(p) if isinstance(p, float) else "N/A"
+        price_lines.append(symbol + ": " + ps + " (" + cs + ")")
+
+    macro_lines = []
+    for label, d in macro.items():
+        val  = d["value"]
+        date = d["date"]
+        prev = d["prev"]
+        if val and val != ".":
+            try:
+                diff = float(val) - float(prev) if prev and prev != "." else 0
+                macro_lines.append(label + ": {:.2f} ({:+.2f} vs prev) as of ".format(float(val), diff) + str(date))
+            except Exception:
+                macro_lines.append(label + ": " + str(val) + " as of " + str(date))
+
+    news_lines   = ["- " + a.get("title","") + " (" + a.get("source",{}).get("name","") + ")"
+                    for a in macro_news[:5]]
+    crypto_lines = ["- " + a.get("title","") + " (" + a.get("source",{}).get("name","") + ")"
+                    for a in crypto_news[:5]]
+    poly_lines   = (["- " + m["question"][:80] + " | YES: {:.0f}% | Vol: ${:.1f}M".format(
+                        m["yes_prob"], m["volume"]/1e6)
+                     for m in poly if m["yes_prob"]] or ["No data"])
+
+    extra = ""
+    if btc_dom:
+        extra += "BTC Dominance: " + str(btc_dom) + "%\n"
+    if funding_rate is not None:
+        extra += "BTC Funding Rate: {:.4f}%\n".format(funding_rate)
+    if ls_ratio is not None:
+        extra += "BTC Long/Short Ratio: {:.2f}\n".format(ls_ratio)
+
+    raw_data = (
+        "CRYPTO PRICES (24h):\n" + "\n".join(price_lines) +
+        "\n\n" + extra +
+        "FEAR & GREED: " + str(fg_value) + " - " + str(fg_label) +
+        "\n\nUS MACRO (FRED):\n" + "\n".join(macro_lines) +
+        "\n\nMACRO HEADLINES:\n" + "\n".join(news_lines) +
+        "\n\nCRYPTO HEADLINES:\n" + "\n".join(crypto_lines) +
+        "\n\nPOLYMARKET:\n" + "\n".join(poly_lines)
+    )
+
+    prompt = (
+        "You are a Lead Macro Analyst reporting directly to Stanley Druckenmiller. "
+        "Identify Inflection Points and Asymmetrical Risk/Reward setups. "
+        "Markets are reflexive. Narrative drives price until liquidity breaks it.\n\n"
+        "RULES:\n"
+        "1. Anticipate not React. Tell me what the market is MISPRICING.\n"
+        "2. The Fed is the Sun. Filter everything through the Fed Reaction Function.\n"
+        "3. The Pig Philosophy. One trade. Risk 1, Reward 5+.\n"
+        "4. Brutal and concise. No fluff.\n\n"
+        "First write exactly 3 sentiment context bullets:\n"
+        "  Geopolitical: [one sentence - geopolitical or macro driver of sentiment]\n"
+        "  Technical: [one sentence - price action, liquidations, key level]\n"
+        "  Macro Flow: [one sentence - capital rotation visible in data]\n\n"
+        "Then write:\n"
+        "THEME: [One sentence defining today macro narrative]\n\n"
+        "THE NARRATIVE GAP: [Retail/media story vs smart money/bond market reality]\n\n"
+        "THE SECOND-ORDER EFFECT: [Biggest story - what does this mean 6-12 months out?]\n\n"
+        "THE PIG TRADE: [Highest conviction asymmetric setup. Risk 1, Reward 5. Be specific.]\n\n"
+        "TODAY DATA RELEASES TO WATCH: [Key data today and what beat/miss means]\n\n"
+        "Raw data:\n" + raw_data + "\n\n"
+        "Under 950 words. Think Druckenmiller, not CNBC."
+    )
+
+    try:
+        r = requests.post(
+            "https://api.groq.com/openai/v1/chat/completions",
+            headers={"Authorization": "Bearer " + GROQ_API_KEY, "Content-Type": "application/json"},
+            json={
+                "model": "llama-3.3-70b-versatile",
+                "messages": [{"role": "user", "content": prompt}],
+                "max_tokens": 1300,
+                "temperature": 0.7,
+            },
+            timeout=30,
+        )
+        return r.json()["choices"][0]["message"]["content"]
+    except Exception as e:
+        return "AI analysis unavailable: " + str(e)
+
+
+def build_message(prices, fg_value, fg_label, macro, poly, calendar,
+                  btc_dom, funding_rate, ls_ratio, ai_text):
+    now   = datetime.now().strftime("%A, %d %b %Y")
+    lines = []
+
+    lines += [
+        "\u2600\ufe0f  <b>MORNING BRIEFING</b>",
+        "\U0001f4c5  <i>" + now + "  \u00b7  Singapore  \u00b7  6 AM</i>",
+        DIV, SPACE,
+    ]
+
+    fg_num = int(fg_value) if fg_value != "N/A" else 50
+    filled = max(1, round(fg_num / 10))
+    bar    = "\u2588" * filled + "\u2591" * (10 - filled)
+    if fg_num <= 25:   fg_emoji = "\U0001f534"
+    elif fg_num <= 45: fg_emoji = "\U0001f7e0"
+    elif fg_num <= 55: fg_emoji = "\U0001f7e1"
+    elif fg_num <= 75: fg_emoji = "\U0001f7e2"
+    else:              fg_emoji = "\U0001f49a"
+
+    lines.append("\U0001f4ca  <b>SENTIMENT GAUGE</b>")
+    lines.append(fg_emoji + "  Index: <b>" + str(fg_value) + " [" + str(fg_label) + "]</b>  " + bar)
+
+    sub = []
+    if btc_dom:
+        sub.append("BTC Dom: <b>" + str(btc_dom) + "%</b>")
+    if funding_rate is not None:
+        fr_label = "Neutral" if abs(funding_rate) < 0.005 else ("Greed \u2191" if funding_rate > 0
