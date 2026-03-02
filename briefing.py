@@ -15,6 +15,12 @@ CRYPTO_WATCHLIST = {
     "hyperliquid": "HYPE",
 }
 
+# Binance futures symbols for Open Interest
+OI_SYMBOLS = {
+    "BTCUSDT": "BTC",
+    "ETHUSDT": "ETH",
+}
+
 FRED_SERIES = {
     "CPIAUCSL": "CPI (Inflation)",
     "UNRATE":   "Unemployment Rate",
@@ -28,7 +34,19 @@ FRED_SERIES = {
     "RSAFS":    "Retail Sales",
 }
 
-DIVIDER = "─" * 24
+# Yahoo Finance tickers for global markets
+MARKET_TICKERS = {
+    "^GSPC":    ("S&P 500",  ""),
+    "^IXIC":    ("Nasdaq",   ""),
+    "^VIX":     ("VIX",      ""),
+    "DX-Y.NYB": ("DXY",     ""),
+    "GC=F":     ("Gold",     "$/oz"),
+    "CL=F":     ("WTI Oil",  "$/bbl"),
+    "^TNX":     ("US 10Y",   "%"),
+}
+
+DIVIDER = "─" * 26
+
 
 # ── TELEGRAM ──────────────────────────────────────────────────────────────────
 def send_telegram(text):
@@ -43,6 +61,30 @@ def send_telegram(text):
             "disable_web_page_preview": True,
         })
 
+
+# ── GLOBAL MARKETS (Yahoo Finance) ────────────────────────────────────────────
+def get_market_snapshot():
+    """Equities, VIX, DXY, Gold, Oil, 10Y yield via Yahoo Finance."""
+    results = {}
+    for ticker, (label, unit) in MARKET_TICKERS.items():
+        try:
+            url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}?interval=1d&range=2d"
+            r   = requests.get(url, timeout=10, headers={"User-Agent": "Mozilla/5.0"}).json()
+            closes = r["chart"]["result"][0]["indicators"]["quote"][0]["close"]
+            closes = [c for c in closes if c is not None]
+            if len(closes) >= 2:
+                prev, curr = closes[-2], closes[-1]
+                chg = ((curr - prev) / prev) * 100
+            elif len(closes) == 1:
+                curr, chg = closes[-1], None
+            else:
+                continue
+            results[label] = {"price": curr, "change_pct": chg, "unit": unit}
+        except Exception:
+            pass
+    return results
+
+
 # ── CRYPTO ────────────────────────────────────────────────────────────────────
 def get_crypto_prices():
     ids = ",".join(CRYPTO_WATCHLIST.keys())
@@ -55,12 +97,26 @@ def get_crypto_prices():
     except Exception:
         return {}
 
+
+def get_eth_btc_ratio(prices):
+    """ETH/BTC ratio — rising = alts gaining; falling = BTC dominance strengthening."""
+    try:
+        eth = prices.get("ethereum", {}).get("usd")
+        btc = prices.get("bitcoin",  {}).get("usd")
+        if eth and btc:
+            return round(eth / btc, 5)
+    except Exception:
+        pass
+    return None
+
+
 def get_fear_greed():
     try:
         d = requests.get("https://api.alternative.me/fng/?limit=1", timeout=10).json()["data"][0]
         return d["value"], d["value_classification"]
     except Exception:
         return "N/A", "N/A"
+
 
 def get_btc_dominance():
     try:
@@ -70,6 +126,7 @@ def get_btc_dominance():
     except Exception:
         return None
 
+
 def get_btc_funding_rate():
     try:
         r = requests.get(
@@ -78,6 +135,7 @@ def get_btc_funding_rate():
         return float(r[0]["fundingRate"]) * 100
     except Exception:
         return None
+
 
 def get_btc_ls_ratio():
     try:
@@ -89,6 +147,46 @@ def get_btc_ls_ratio():
         return float(r[0]["longShortRatio"])
     except Exception:
         return None
+
+
+def get_open_interest():
+    """
+    BTC and ETH Open Interest from Binance Futures.
+    Returns { label: {oi_usd, oi_change_pct} }
+    OI change is 1h delta from historical endpoint.
+    """
+    results = {}
+    for symbol, label in OI_SYMBOLS.items():
+        try:
+            # Current OI (in contracts)
+            oi_now = float(
+                requests.get(f"https://fapi.binance.com/fapi/v1/openInterest?symbol={symbol}", timeout=10)
+                .json()["openInterest"]
+            )
+            # 1h historical for delta
+            hist = requests.get(
+                f"https://fapi.binance.com/futures/data/openInterestHist"
+                f"?symbol={symbol}&period=1h&limit=2",
+                timeout=10,
+            ).json()
+            if len(hist) >= 2:
+                oi_prev   = float(hist[0]["sumOpenInterest"])
+                oi_curr_h = float(hist[1]["sumOpenInterest"])
+                chg_pct   = ((oi_curr_h - oi_prev) / oi_prev) * 100 if oi_prev else None
+            else:
+                chg_pct = None
+
+            # Mark price to convert contracts → USD
+            mark  = float(
+                requests.get(f"https://fapi.binance.com/fapi/v1/premiumIndex?symbol={symbol}", timeout=10)
+                .json()["markPrice"]
+            )
+            oi_usd = oi_now * mark
+            results[label] = {"oi_usd": oi_usd, "oi_change_pct": chg_pct}
+        except Exception:
+            pass
+    return results
+
 
 # ── MACRO ─────────────────────────────────────────────────────────────────────
 def get_fred_latest(series_id):
@@ -106,12 +204,14 @@ def get_fred_latest(series_id):
     except Exception:
         return None, None, None
 
+
 def get_all_macro():
     results = {}
     for series_id, label in FRED_SERIES.items():
         val, date, prev = get_fred_latest(series_id)
         results[label] = {"value": val, "date": date, "prev": prev}
     return results
+
 
 def was_released_today(date_str):
     if not date_str:
@@ -121,18 +221,15 @@ def was_released_today(date_str):
     except Exception:
         return False
 
+
 # ── CALENDAR ──────────────────────────────────────────────────────────────────
 def get_weekly_calendar():
-    """
-    Returns (by_day_dict, today_events_list).
-    today_events_list contains only events for today — passed to the AI so it
-    never hallucinates data releases.
-    """
+    """Returns (by_day_dict, today_events_list). today_events is fed to AI to prevent hallucination."""
     try:
-        r      = requests.get("https://nfs.faireconomy.media/ff_calendar_thisweek.json", timeout=10).json()
-        by_day = {}
-        today_events = []
+        r         = requests.get("https://nfs.faireconomy.media/ff_calendar_thisweek.json", timeout=10).json()
+        by_day    = {}
         today_str = datetime.now().strftime("%Y-%m-%d")
+        today_ev  = []
 
         for e in r:
             if e.get("country", "").upper() != "USD":
@@ -146,22 +243,21 @@ def get_weekly_calendar():
             except Exception:
                 continue
 
-            fire   = " 🔴" if impact == "high" else " 🟡"
+            badge  = " 🔴" if impact == "high" else " 🟡"
             detail = ""
-            if e.get("forecast"):
-                detail += f"  Fcst: {e['forecast']}"
-            if e.get("previous"):
-                detail += f"  Prev: {e['previous']}"
+            if e.get("forecast"): detail += f"  Fcst: {e['forecast']}"
+            if e.get("previous"): detail += f"  Prev: {e['previous']}"
 
-            entry = e.get("title", "Unknown") + fire + detail
+            entry = e.get("title", "Unknown") + badge + detail
             by_day.setdefault(day_key, []).append(entry)
 
             if event_date == today_str:
-                today_events.append(e.get("title", "Unknown") + detail)
+                today_ev.append(e.get("title", "Unknown") + detail)
 
-        return by_day, today_events
+        return by_day, today_ev
     except Exception:
         return {}, []
+
 
 # ── POLYMARKET ────────────────────────────────────────────────────────────────
 def get_polymarket_top():
@@ -185,6 +281,7 @@ def get_polymarket_top():
     except Exception:
         return []
 
+
 # ── NEWS ──────────────────────────────────────────────────────────────────────
 def get_news(query, page_size=5):
     try:
@@ -196,20 +293,39 @@ def get_news(query, page_size=5):
     except Exception:
         return []
 
+
 # ── AI ANALYSIS ───────────────────────────────────────────────────────────────
 def get_groq_analysis(prices, fg_value, fg_label, macro,
                       macro_news, crypto_news, poly,
                       btc_dom, funding_rate, ls_ratio,
-                      today_events):           # ← NEW: real calendar data
+                      today_events, markets, oi_data, eth_btc_ratio):
+
+    # Crypto prices block
     price_lines = []
     for coin_id, symbol in CRYPTO_WATCHLIST.items():
         d  = prices.get(coin_id, {})
-        p  = d.get("usd", "N/A")
+        p  = d.get("usd")
         c  = d.get("usd_24h_change")
-        cs = (f"+{c:.2f}%" if c >= 0 else f"{c:.2f}%") if c is not None else "N/A"
-        ps = f"${p:,.2f}" if isinstance(p, float) else "N/A"
+        cs = f"{c:+.2f}%" if c is not None else "N/A"
+        ps = f"${p:,.2f}" if p else "N/A"
         price_lines.append(f"{symbol}: {ps} ({cs})")
+    if eth_btc_ratio:
+        price_lines.append(f"ETH/BTC Ratio: {eth_btc_ratio:.5f}")
 
+    # Global markets block
+    market_lines = [
+        f"{label}: {d['price']:,.2f} ({d['change_pct']:+.2f}%)" if d["change_pct"] is not None
+        else f"{label}: {d['price']:,.2f}"
+        for label, d in markets.items()
+    ]
+
+    # OI block
+    oi_lines = []
+    for label, d in oi_data.items():
+        chg = f"{d['oi_change_pct']:+.2f}%" if d["oi_change_pct"] is not None else "N/A"
+        oi_lines.append(f"{label} OI: ${d['oi_usd']/1e9:.2f}B (1h chg: {chg})")
+
+    # Macro block
     macro_lines = []
     for label, d in macro.items():
         val, date, prev = d["value"], d["date"], d["prev"]
@@ -232,45 +348,60 @@ def get_groq_analysis(prices, fg_value, fg_label, macro,
     if funding_rate is not None: extra += f"BTC Funding Rate: {funding_rate:.4f}%\n"
     if ls_ratio     is not None: extra += f"BTC Long/Short Ratio: {ls_ratio:.2f}\n"
 
-    # Build today's calendar block for the AI — empty = explicitly say so
-    if today_events:
-        today_block = "TODAY'S SCHEDULED US DATA RELEASES:\n" + "\n".join(f"- {e}" for e in today_events)
-    else:
-        today_block = "TODAY'S SCHEDULED US DATA RELEASES: None scheduled today."
+    today_block = (
+        "TODAY'S SCHEDULED US DATA RELEASES:\n" + "\n".join(f"- {e}" for e in today_events)
+        if today_events else
+        "TODAY'S SCHEDULED US DATA RELEASES: None scheduled today."
+    )
 
-    raw_data = "\n\n".join([
-        "CRYPTO PRICES (24h):\n" + "\n".join(price_lines),
+    raw_data = "\n\n".join(filter(None, [
+        "CRYPTO PRICES (24h):\n"  + "\n".join(price_lines),
+        "GLOBAL MARKETS:\n"        + "\n".join(market_lines),
+        "OPEN INTEREST:\n"         + "\n".join(oi_lines) if oi_lines else "",
         extra.strip(),
         f"FEAR & GREED: {fg_value} - {fg_label}",
-        "US MACRO (FRED):\n" + "\n".join(macro_lines),
-        "MACRO HEADLINES:\n" + "\n".join(news_lines),
-        "CRYPTO HEADLINES:\n" + "\n".join(crypto_lines),
-        "POLYMARKET:\n" + "\n".join(poly_lines),
-        today_block,   # ← grounding the AI with real data
-    ])
+        "US MACRO (FRED):\n"       + "\n".join(macro_lines),
+        "MACRO HEADLINES:\n"       + "\n".join(news_lines),
+        "CRYPTO HEADLINES:\n"      + "\n".join(crypto_lines),
+        "POLYMARKET:\n"            + "\n".join(poly_lines),
+        today_block,
+    ]))
 
     prompt = f"""You are a Lead Macro Analyst reporting directly to Stanley Druckenmiller.
 
-CRITICAL RULE: For the "TODAY DATA RELEASES TO WATCH" section you must ONLY reference \
-events listed under "TODAY'S SCHEDULED US DATA RELEASES" in the raw data below. \
-If none are listed, say "No major US data releases scheduled today." \
-Do NOT invent, hallucinate, or recall events from memory.
+CRITICAL RULES:
+1. For "TODAY DATA RELEASES TO WATCH" — reference ONLY events listed under \
+"TODAY'S SCHEDULED US DATA RELEASES" in the raw data. If none are listed, say \
+"No major US data releases scheduled today." Never invent events from memory.
+2. For KEY LEVELS — use actual prices from the raw data as anchors. \
+Round to clean levels (e.g. if BTC is $83,200, say "watch $85K / $80K"). Never fabricate prices.
+3. Be sharp, not verbose. No filler. Every sentence must earn its place.
 
-Write exactly in this structure:
+Output EXACTLY this structure — no extra headers or preamble:
 
-Geopolitical: [one sentence on geopolitical or macro driver of current sentiment]
-Technical: [one sentence on price action, liquidations, or key level broken]
-Macro Flow: [one sentence on capital rotation visible in the data]
+Geopolitical: [one sentence — geopolitical or macro driver of current risk sentiment]
+Technical: [one sentence — price action, key level broken, or liquidation event]
+Macro Flow: [one sentence — capital rotation visible in the data]
 
 THEME: [One sentence defining today's macro narrative]
 
-THE NARRATIVE GAP: [Retail story vs smart money reality]
+CONVICTION: [BULLISH / NEUTRAL / BEARISH]  [X/10]
+[One sentence justifying the score]
 
-THE SECOND-ORDER EFFECT: [What does the biggest story mean 6-12 months out]
+THE NARRATIVE GAP: [What retail believes vs. what the data actually shows]
 
-THE PIG TRADE: [Single highest conviction asymmetric setup. Risk 1, Reward 5.]
+THE SECOND-ORDER EFFECT: [What today's biggest story means 6-12 months out]
 
-TODAY DATA RELEASES TO WATCH: [Reference ONLY events from the calendar data provided. If none, say so clearly.]
+THE PIG TRADE: [Single highest-conviction asymmetric setup. Risk 1, Reward 5. Be specific.]
+
+KEY LEVELS TO WATCH:
+BTC: [support] / [resistance]
+ETH: [support] / [resistance]
+DXY: [level that matters and why — one clause]
+
+WHAT CHANGES MY MIND: [The one data point, price level, or event that invalidates the thesis]
+
+TODAY DATA RELEASES TO WATCH: [ONLY from calendar data provided. If none, say so.]
 
 Raw data:
 {raw_data}
@@ -284,8 +415,8 @@ Under 950 words. Think Druckenmiller, not CNBC."""
             json={
                 "model":       "llama-3.3-70b-versatile",
                 "messages":    [{"role": "user", "content": prompt}],
-                "max_tokens":  1300,
-                "temperature": 0.4,   # lower = more factual, less creative hallucination
+                "max_tokens":  1400,
+                "temperature": 0.35,
             },
             timeout=30,
         )
@@ -293,9 +424,11 @@ Under 950 words. Think Druckenmiller, not CNBC."""
     except Exception as e:
         return f"AI analysis unavailable: {e}"
 
+
 # ── MESSAGE BUILDER ───────────────────────────────────────────────────────────
 def build_message(prices, fg_value, fg_label, macro, poly, calendar,
-                  btc_dom, funding_rate, ls_ratio, ai_text):
+                  btc_dom, funding_rate, ls_ratio, ai_text,
+                  markets, oi_data, eth_btc_ratio):
     now   = datetime.now().strftime("%A, %d %b %Y")
     lines = []
 
@@ -303,22 +436,19 @@ def build_message(prices, fg_value, fg_label, macro, poly, calendar,
     lines += [
         "☀️  <b>MORNING BRIEFING</b>",
         f"📅  <i>{now}  ·  Singapore  ·  6 AM</i>",
-        DIVIDER,
-        "",
+        DIVIDER, "",
     ]
 
     # ── Sentiment ─────────────────────────────────────────────────────────────
-    fg_num = int(fg_value) if str(fg_value).isdigit() else 50
-    filled = max(1, round(fg_num / 10))
-    bar    = "█" * filled + "░" * (10 - filled)
+    fg_num   = int(fg_value) if str(fg_value).isdigit() else 50
+    filled   = max(1, round(fg_num / 10))
+    bar      = "█" * filled + "░" * (10 - filled)
     fg_emoji = (
         "🔴" if fg_num <= 25 else
         "🟠" if fg_num <= 45 else
         "🟡" if fg_num <= 55 else
-        "🟢" if fg_num <= 75 else
-        "💚"
+        "🟢" if fg_num <= 75 else "💚"
     )
-
     lines += ["📊  <b>SENTIMENT</b>", f"{fg_emoji}  <b>{fg_value} — {fg_label}</b>  {bar}"]
 
     sub_parts = []
@@ -332,7 +462,7 @@ def build_message(prices, fg_value, fg_label, macro, poly, calendar,
     if sub_parts:
         lines.append("  " + "  ·  ".join(sub_parts))
 
-    # Geopolitical / Technical / Macro Flow bullets from AI
+    # AI situational awareness bullets (shown here, stripped from AI section below)
     sent_bullets = []
     for keyword in ("Geopolitical:", "Technical:", "Macro Flow:"):
         for line in ai_text.split("\n"):
@@ -343,7 +473,38 @@ def build_message(prices, fg_value, fg_label, macro, poly, calendar,
         lines += [""] + sent_bullets
     lines.append("")
 
-    # ── Crypto ────────────────────────────────────────────────────────────────
+    # ── Global Market Snapshot ────────────────────────────────────────────────
+    lines += [DIVIDER, "🌍  <b>MARKET SNAPSHOT</b>", ""]
+
+    def fmt_market_row(label, d):
+        p = d["price"]
+        c = d["change_pct"]
+        if label == "VIX":
+            ps = f"{p:.2f}"
+        elif label in ("DXY", "US 10Y"):
+            ps = f"{p:.3f}"
+        elif label in ("Gold", "WTI Oil"):
+            ps = f"${p:,.1f}"
+        else:
+            ps = f"{p:,.0f}"
+        cs = (f"{'▲' if c >= 0 else '▼'} {abs(c):.2f}%") if c is not None else "—"
+        return f"  <b>{label}</b>   {ps}   {cs}"
+
+    eq_labels  = [l for l in ("S&P 500", "Nasdaq") if l in markets]
+    mac_labels = [l for l in ("VIX", "DXY", "US 10Y", "Gold", "WTI Oil") if l in markets]
+
+    if eq_labels:
+        lines.append("<i>Equities</i>")
+        for lbl in eq_labels:
+            lines.append(fmt_market_row(lbl, markets[lbl]))
+        lines.append("")
+    if mac_labels:
+        lines.append("<i>Macro Assets</i>")
+        for lbl in mac_labels:
+            lines.append(fmt_market_row(lbl, markets[lbl]))
+        lines.append("")
+
+    # ── Crypto Watchlist ──────────────────────────────────────────────────────
     lines += [DIVIDER, "💰  <b>CRYPTO WATCHLIST</b>", ""]
     for coin_id, symbol in CRYPTO_WATCHLIST.items():
         d      = prices.get(coin_id, {})
@@ -352,15 +513,23 @@ def build_message(prices, fg_value, fg_label, macro, poly, calendar,
         mcap   = d.get("usd_market_cap")
         ps     = f"${price:,.2f}" if price else "N/A"
         ms     = f"  <i>${mcap/1e9:.1f}B</i>" if mcap else ""
-        if change is not None:
-            arrow = "▲" if change >= 0 else "▼"
-            cs    = f"{arrow} {abs(change):.2f}%"
-        else:
-            cs = "—"
+        cs     = (f"{'▲' if change >= 0 else '▼'} {abs(change):.2f}%") if change is not None else "—"
         lines.append(f"  <b>{symbol}</b>   {ps}   {cs}{ms}")
+
+    if eth_btc_ratio is not None:
+        lines.append(f"  <b>ETH/BTC</b>   {eth_btc_ratio:.5f}   <i>(alt season proxy)</i>")
     lines.append("")
 
-    # ── Macro ─────────────────────────────────────────────────────────────────
+    if oi_data:
+        lines.append("<i>Open Interest — Binance Futures</i>")
+        for label, d in oi_data.items():
+            oi_b    = d["oi_usd"] / 1e9
+            chg     = d["oi_change_pct"]
+            chg_str = (f"  {'▲' if chg >= 0 else '▼'} {abs(chg):.2f}% 1h") if chg is not None else ""
+            lines.append(f"  <b>{label} OI</b>   ${oi_b:.2f}B{chg_str}")
+        lines.append("")
+
+    # ── US Macro Data ─────────────────────────────────────────────────────────
     lines += [DIVIDER, "📉  <b>US MACRO DATA</b>", ""]
     new_releases = []
     for label, d in macro.items():
@@ -389,7 +558,7 @@ def build_message(prices, fg_value, fg_label, macro, poly, calendar,
         lines.append("⏰  <i>No new US data releases today</i>")
     lines.append("")
 
-    # ── Weekly Calendar ───────────────────────────────────────────────────────
+    # ── Economic Docket ───────────────────────────────────────────────────────
     lines += [DIVIDER, "📅  <b>ECONOMIC DOCKET — THIS WEEK</b>", ""]
     if calendar:
         for day, events in calendar.items():
@@ -406,15 +575,15 @@ def build_message(prices, fg_value, fg_label, macro, poly, calendar,
         for m in poly:
             vol = f"${m['volume']/1e6:.1f}M" if m["volume"] >= 1e6 else f"${m['volume']:,.0f}"
             yes = f"  <b>YES {m['yes_prob']:.0f}%</b>" if m["yes_prob"] else ""
-            lines.append(f"  • {m['question'][:75]}{yes}  <i>{vol}</i>")
+            lines.append(f"  •  {m['question'][:72]}{yes}  <i>{vol}</i>")
     else:
         lines.append("  <i>Could not load Polymarket data</i>")
     lines.append("")
 
-    # ── AI Analysis ───────────────────────────────────────────────────────────
+    # ── Druckenmiller Analysis ────────────────────────────────────────────────
     lines += [DIVIDER, "🧠  <b>DRUCKENMILLER ANALYSIS</b>", ""]
 
-    # Strip the 3 sentiment bullets already shown above
+    # Strip situational bullets already shown in sentiment section above
     clean_ai, skip = [], False
     for line in ai_text.split("\n"):
         if any(k in line for k in ("Geopolitical:", "Technical:", "Macro Flow:")):
@@ -427,36 +596,41 @@ def build_message(prices, fg_value, fg_label, macro, poly, calendar,
     lines.append("")
 
     # ── Footer ────────────────────────────────────────────────────────────────
-    lines += [DIVIDER, "🤖  <i>CoinGecko · Binance · FRED · Polymarket · Groq AI</i>"]
+    lines += [DIVIDER, "🤖  <i>Yahoo Finance · CoinGecko · Binance · FRED · Polymarket · Groq AI</i>"]
 
     return "\n".join(lines)
+
 
 # ── MAIN ──────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     print("Fetching data...")
-    prices             = get_crypto_prices()
-    fg_value, fg_label = get_fear_greed()
-    macro              = get_all_macro()
-    poly               = get_polymarket_top()
-    macro_news         = get_news("Federal Reserve OR CPI OR inflation OR GDP OR recession OR FOMC OR ISM PMI", 5)
-    crypto_news        = get_news("bitcoin OR ethereum OR crypto OR DeFi OR polymarket OR hyperliquid", 5)
-    calendar, today_events = get_weekly_calendar()   # ← now returns today's events separately
-    btc_dom            = get_btc_dominance()
-    funding_rate       = get_btc_funding_rate()
-    ls_ratio           = get_btc_ls_ratio()
+    prices              = get_crypto_prices()
+    markets             = get_market_snapshot()
+    fg_value, fg_label  = get_fear_greed()
+    macro               = get_all_macro()
+    poly                = get_polymarket_top()
+    macro_news          = get_news("Federal Reserve OR CPI OR inflation OR GDP OR recession OR FOMC OR ISM PMI", 5)
+    crypto_news         = get_news("bitcoin OR ethereum OR crypto OR DeFi OR polymarket OR hyperliquid", 5)
+    calendar, today_ev  = get_weekly_calendar()
+    btc_dom             = get_btc_dominance()
+    funding_rate        = get_btc_funding_rate()
+    ls_ratio            = get_btc_ls_ratio()
+    oi_data             = get_open_interest()
+    eth_btc_ratio       = get_eth_btc_ratio(prices)
 
     print("Running AI analysis...")
     ai_text = get_groq_analysis(
         prices, fg_value, fg_label, macro,
         macro_news, crypto_news, poly,
         btc_dom, funding_rate, ls_ratio,
-        today_events,   # ← real calendar grounding
+        today_ev, markets, oi_data, eth_btc_ratio,
     )
 
     print("Building message...")
     full_message = build_message(
         prices, fg_value, fg_label, macro, poly, calendar,
         btc_dom, funding_rate, ls_ratio, ai_text,
+        markets, oi_data, eth_btc_ratio,
     )
 
     print("Sending to Telegram...")
