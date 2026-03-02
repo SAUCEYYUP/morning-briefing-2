@@ -1,12 +1,14 @@
+import json
 import requests
-from datetime import datetime
+from datetime import datetime, timedelta
 
 # ── CONFIG ────────────────────────────────────────────────────────────────────
-TELEGRAM_BOT_TOKEN = "8734149271:AAHM5T5diwscMnfk7gzGkiRsP-uRbURVcjs"
-TELEGRAM_CHAT_ID   = "623392672"
-NEWS_API_KEY       = "425b2c8e51244bb9a09880eec07d56fb"
-FRED_API_KEY       = "bea607ec27e9abfbb37124f5013e115e"
-GROQ_API_KEY       = "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"
+TELEGRAM_BOT_TOKEN  = "8734149271:AAHM5T5diwscMnfk7gzGkiRsP-uRbURVcjs"
+TELEGRAM_CHAT_ID    = "623392672"
+THESIS_CHANNEL_ID   = "-1003787201269"   # private channel — bot is admin
+NEWS_API_KEY        = "425b2c8e51244bb9a09880eec07d56fb"
+FRED_API_KEY        = "bea607ec27e9abfbb37124f5013e115e"
+GROQ_API_KEY        = "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"
 
 CRYPTO_WATCHLIST = {
     "bitcoin":     "BTC",
@@ -15,7 +17,6 @@ CRYPTO_WATCHLIST = {
     "hyperliquid": "HYPE",
 }
 
-# Binance futures symbols for Open Interest
 OI_SYMBOLS = {
     "BTCUSDT": "BTC",
     "ETHUSDT": "ETH",
@@ -34,21 +35,325 @@ FRED_SERIES = {
     "RSAFS":    "Retail Sales",
 }
 
-# Yahoo Finance tickers for global markets
 MARKET_TICKERS = {
-    "^GSPC":    ("S&P 500",  ""),
-    "^IXIC":    ("Nasdaq",   ""),
-    "^VIX":     ("VIX",      ""),
-    "DX-Y.NYB": ("DXY",     ""),
-    "GC=F":     ("Gold",     "$/oz"),
-    "CL=F":     ("WTI Oil",  "$/bbl"),
-    "^TNX":     ("US 10Y",   "%"),
+    "^GSPC":    ("S&P 500", ""),
+    "^IXIC":    ("Nasdaq",  ""),
+    "^VIX":     ("VIX",     ""),
+    "DX-Y.NYB": ("DXY",    ""),
+    "GC=F":     ("Gold",    "$/oz"),
+    "CL=F":     ("WTI Oil", "$/bbl"),
+    "^TNX":     ("US 10Y",  "%"),
 }
 
 DIVIDER = "─" * 26
 
 
-# ── TELEGRAM ──────────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# THESIS STORE  —  Telegram private channel as database
+# The pinned message in THESIS_CHANNEL_ID holds a JSON blob.
+# Monday  → generate fresh thesis, post + pin new message.
+# Tue–Fri → read pinned message, score today, edit message in-place.
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _tg(method, **kwargs):
+    """Raw Telegram API call. Returns response JSON."""
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/{method}"
+    try:
+        r = requests.post(url, json=kwargs, timeout=15)
+        return r.json()
+    except Exception as e:
+        print(f"[TG ERROR] {method}: {e}")
+        return {}
+
+
+def thesis_load():
+    """
+    Read the pinned message from the thesis channel.
+    Returns (message_id, thesis_dict) or (None, None) if nothing pinned.
+    """
+    info = _tg("getChat", chat_id=THESIS_CHANNEL_ID)
+    pinned = info.get("result", {}).get("pinned_message")
+    if not pinned:
+        return None, None
+    try:
+        text  = pinned.get("text", "")
+        # JSON is stored between sentinel markers so other text can coexist
+        start = text.index("<<<THESIS_JSON>>>") + len("<<<THESIS_JSON>>>")
+        end   = text.index("<<<END_THESIS>>>")
+        data  = json.loads(text[start:end].strip())
+        return pinned["message_id"], data
+    except Exception:
+        return pinned.get("message_id"), None
+
+
+def thesis_save(message_id, data):
+    """
+    Persist thesis dict.
+    If message_id is None → post a new message and pin it.
+    Otherwise → edit the existing pinned message in-place.
+    """
+    blob = f"<<<THESIS_JSON>>>\n{json.dumps(data, indent=2)}\n<<<END_THESIS>>>"
+    if message_id is None:
+        # First ever post — send then pin
+        resp = _tg("sendMessage", chat_id=THESIS_CHANNEL_ID, text=blob)
+        mid  = resp.get("result", {}).get("message_id")
+        if mid:
+            _tg("pinChatMessage", chat_id=THESIS_CHANNEL_ID,
+                message_id=mid, disable_notification=True)
+        return mid
+    else:
+        _tg("editMessageText", chat_id=THESIS_CHANNEL_ID,
+            message_id=message_id, text=blob)
+        return message_id
+
+
+def is_monday():
+    return datetime.now().weekday() == 0   # 0 = Monday
+
+
+def week_of_monday():
+    """ISO date string of this week's Monday."""
+    today = datetime.now().date()
+    return str(today - timedelta(days=today.weekday()))
+
+
+def day_number_in_week():
+    """1 = Monday … 5 = Friday."""
+    return datetime.now().weekday() + 1
+
+
+# ── AI: generate Monday thesis ─────────────────────────────────────────────
+def generate_weekly_thesis(raw_data_str):
+    prompt = f"""You are a Lead Macro Analyst at a global macro hedge fund.
+It is Monday morning. Generate this week's macro thesis.
+
+Output EXACTLY this JSON and nothing else — no preamble, no markdown fences:
+{{
+  "thesis": "<2-3 sentence directional macro view for the week>",
+  "conviction_direction": "<BULLISH|NEUTRAL|BEARISH>",
+  "conviction_score": <integer 1-10>,
+  "key_variables": [
+    "<specific measurable thing that will CONFIRM the thesis>",
+    "<specific measurable thing that will CONFIRM the thesis>",
+    "<specific measurable thing that will CHALLENGE the thesis>"
+  ],
+  "invalidation": "<single sentence: the one event or print that kills this thesis entirely>"
+}}
+
+Raw market data:
+{raw_data_str}
+
+Be specific. Use actual prices and levels from the data. Think Druckenmiller."""
+
+    try:
+        r = requests.post(
+            "https://api.groq.com/openai/v1/chat/completions",
+            headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
+            json={
+                "model":       "llama-3.3-70b-versatile",
+                "messages":    [{"role": "user", "content": prompt}],
+                "max_tokens":  600,
+                "temperature": 0.3,
+            },
+            timeout=30,
+        )
+        text = r.json()["choices"][0]["message"]["content"].strip()
+        # Strip accidental markdown fences
+        text = text.replace("```json", "").replace("```", "").strip()
+        return json.loads(text)
+    except Exception as e:
+        print(f"[THESIS GEN ERROR] {e}")
+        return None
+
+
+# ── AI: score today against thesis ────────────────────────────────────────
+def score_today_vs_thesis(thesis_data, raw_data_str, today_events):
+    today_str = datetime.now().strftime("%A %d %b")
+    calendar_note = (
+        "Today's scheduled data: " + ", ".join(today_events)
+        if today_events else "No major data scheduled today."
+    )
+
+    prompt = f"""You are a Lead Macro Analyst scoring today's data against Monday's weekly thesis.
+
+MONDAY'S THESIS:
+\"{thesis_data['thesis']}\"
+Direction: {thesis_data['conviction_direction']}  {thesis_data['conviction_score']}/10
+Key variables:
+{chr(10).join(f"- {v}" for v in thesis_data['key_variables'])}
+Invalidation trigger: {thesis_data['invalidation']}
+
+Today is {today_str}. {calendar_note}
+
+Today's raw market data:
+{raw_data_str}
+
+Output EXACTLY this JSON and nothing else — no preamble, no markdown fences:
+{{
+  "status": "<CONFIRMS|CHALLENGED|INVALIDATED>",
+  "note": "<1-2 sharp sentences: what today's data did to the thesis>",
+  "variables_status": [
+    "<✅ HOLDING | ⚠️ AT RISK | ❌ BROKEN>: <variable 1 text>",
+    "<✅ HOLDING | ⚠️ AT RISK | ❌ BROKEN>: <variable 2 text>",
+    "<✅ HOLDING | ⚠️ AT RISK | ❌ BROKEN>: <variable 3 text>"
+  ]
+}}
+
+Be blunt. Reference actual prices. No filler."""
+
+    try:
+        r = requests.post(
+            "https://api.groq.com/openai/v1/chat/completions",
+            headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
+            json={
+                "model":       "llama-3.3-70b-versatile",
+                "messages":    [{"role": "user", "content": prompt}],
+                "max_tokens":  400,
+                "temperature": 0.25,
+            },
+            timeout=30,
+        )
+        text = r.json()["choices"][0]["message"]["content"].strip()
+        text = text.replace("```json", "").replace("```", "").strip()
+        return json.loads(text)
+    except Exception as e:
+        print(f"[THESIS SCORE ERROR] {e}")
+        return None
+
+
+# ── Orchestrator: run thesis logic, return display block ──────────────────
+def run_thesis_tracker(raw_data_str, today_events):
+    """
+    Main entry point for the thesis tracker.
+    Returns (thesis_data, today_score, display_block_lines).
+    """
+    msg_id, thesis_data = thesis_load()
+    today_str   = datetime.now().strftime("%Y-%m-%d")
+    day_num     = day_number_in_week()
+    week_monday = week_of_monday()
+
+    # ── Monday: always generate a fresh thesis ─────────────────────────────
+    if is_monday() or thesis_data is None or thesis_data.get("week_of") != week_monday:
+        print("Generating new weekly thesis (Monday)...")
+        new_thesis = generate_weekly_thesis(raw_data_str)
+        if new_thesis is None:
+            return None, None, ["  <i>Thesis generation failed — will retry tomorrow.</i>"]
+
+        thesis_data = {
+            "week_of":              week_monday,
+            "thesis":               new_thesis["thesis"],
+            "conviction_direction": new_thesis["conviction_direction"],
+            "conviction_score":     new_thesis["conviction_score"],
+            "key_variables":        new_thesis["key_variables"],
+            "invalidation":         new_thesis["invalidation"],
+            "daily_scores":         [],   # will be populated Tue–Fri
+        }
+        # Score Monday itself
+        today_score = score_today_vs_thesis(thesis_data, raw_data_str, today_events)
+        if today_score:
+            today_score["date"] = today_str
+            thesis_data["daily_scores"].append(today_score)
+
+        thesis_save(msg_id, thesis_data)
+
+    # ── Tue–Fri: score today if not already scored ─────────────────────────
+    else:
+        already_scored = any(d.get("date") == today_str for d in thesis_data.get("daily_scores", []))
+        if already_scored:
+            # Carry forward — mark the gap if previous day is missing
+            today_score = next(
+                (d for d in thesis_data["daily_scores"] if d["date"] == today_str), None
+            )
+        else:
+            print("Scoring today vs weekly thesis...")
+            # Check if yesterday was scored; if not, note the gap
+            yesterday = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
+            gap_note  = ""
+            if not any(d.get("date") == yesterday for d in thesis_data.get("daily_scores", [])):
+                gap_note = " [Gap: previous day not scored — carrying forward.]"
+
+            today_score = score_today_vs_thesis(thesis_data, raw_data_str, today_events)
+            if today_score:
+                today_score["date"]     = today_str
+                today_score["gap_note"] = gap_note
+                thesis_data["daily_scores"].append(today_score)
+                thesis_save(msg_id, thesis_data)
+
+    # ── Build display block ────────────────────────────────────────────────
+    lines = _build_thesis_block(thesis_data, today_score, day_num)
+    return thesis_data, today_score, lines
+
+
+def _build_thesis_block(thesis_data, today_score, day_num):
+    lines = []
+
+    direction = thesis_data.get("conviction_direction", "NEUTRAL")
+    score     = thesis_data.get("conviction_score", 5)
+    dir_emoji = {"BULLISH": "🟢", "NEUTRAL": "🟡", "BEARISH": "🔴"}.get(direction, "⚪")
+
+    # Score bar  e.g. ▓▓▓▓▓▓░░░░  6/10
+    filled  = max(1, score)
+    bar     = "▓" * filled + "░" * (10 - filled)
+
+    # Running tally from daily_scores
+    scores_list = thesis_data.get("daily_scores", [])
+    confirms    = sum(1 for d in scores_list if d.get("status") == "CONFIRMS")
+    challenged  = sum(1 for d in scores_list if d.get("status") == "CHALLENGED")
+    invalidated = sum(1 for d in scores_list if d.get("status") == "INVALIDATED")
+
+    lines += [
+        DIVIDER,
+        f"📋  <b>WEEKLY THESIS</b>  —  Day {day_num}/5",
+        "",
+        f"{dir_emoji}  <b>{direction}</b>  {score}/10   {bar}",
+        "",
+        f"<i>{thesis_data.get('thesis', 'No thesis available.')}</i>",
+        "",
+        "<b>Key Variables:</b>",
+    ]
+
+    # Variable statuses — use today's score if available, else raw variables
+    if today_score and today_score.get("variables_status"):
+        for vs in today_score["variables_status"]:
+            lines.append(f"  {vs}")
+    else:
+        for v in thesis_data.get("key_variables", []):
+            lines.append(f"  ⬜ {v}")
+
+    lines += [
+        "",
+        f"<b>Invalidation trigger:</b>  <i>{thesis_data.get('invalidation', '—')}</i>",
+        "",
+    ]
+
+    # Today's score
+    if today_score:
+        status     = today_score.get("status", "—")
+        note       = today_score.get("note", "")
+        gap        = today_score.get("gap_note", "")
+        status_map = {"CONFIRMS": "✅ CONFIRMS", "CHALLENGED": "⚠️ CHALLENGED", "INVALIDATED": "❌ INVALIDATED"}
+        status_str = status_map.get(status, status)
+        lines += [
+            f"<b>Today:</b>  {status_str}",
+            f"<i>{note}</i>",
+        ]
+        if gap:
+            lines.append(f"<i>{gap}</i>")
+    else:
+        lines.append("<b>Today:</b>  <i>Scoring unavailable</i>")
+
+    lines += [
+        "",
+        f"<b>Week:</b>  ✅ {confirms} confirms  ·  ⚠️ {challenged} challenged  ·  ❌ {invalidated} invalidated",
+    ]
+
+    return lines
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TELEGRAM
+# ══════════════════════════════════════════════════════════════════════════════
+
 def send_telegram(text):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     while text:
@@ -62,14 +367,16 @@ def send_telegram(text):
         })
 
 
-# ── GLOBAL MARKETS (Yahoo Finance) ────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# MARKET DATA
+# ══════════════════════════════════════════════════════════════════════════════
+
 def get_market_snapshot():
-    """Equities, VIX, DXY, Gold, Oil, 10Y yield via Yahoo Finance."""
     results = {}
     for ticker, (label, unit) in MARKET_TICKERS.items():
         try:
-            url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}?interval=1d&range=2d"
-            r   = requests.get(url, timeout=10, headers={"User-Agent": "Mozilla/5.0"}).json()
+            url    = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}?interval=1d&range=2d"
+            r      = requests.get(url, timeout=10, headers={"User-Agent": "Mozilla/5.0"}).json()
             closes = r["chart"]["result"][0]["indicators"]["quote"][0]["close"]
             closes = [c for c in closes if c is not None]
             if len(closes) >= 2:
@@ -85,7 +392,6 @@ def get_market_snapshot():
     return results
 
 
-# ── CRYPTO ────────────────────────────────────────────────────────────────────
 def get_crypto_prices():
     ids = ",".join(CRYPTO_WATCHLIST.keys())
     url = (
@@ -99,7 +405,6 @@ def get_crypto_prices():
 
 
 def get_eth_btc_ratio(prices):
-    """ETH/BTC ratio — rising = alts gaining; falling = BTC dominance strengthening."""
     try:
         eth = prices.get("ethereum", {}).get("usd")
         btc = prices.get("bitcoin",  {}).get("usd")
@@ -150,45 +455,38 @@ def get_btc_ls_ratio():
 
 
 def get_open_interest():
-    """
-    BTC and ETH Open Interest from Binance Futures.
-    Returns { label: {oi_usd, oi_change_pct} }
-    OI change is 1h delta from historical endpoint.
-    """
     results = {}
     for symbol, label in OI_SYMBOLS.items():
         try:
-            # Current OI (in contracts)
             oi_now = float(
                 requests.get(f"https://fapi.binance.com/fapi/v1/openInterest?symbol={symbol}", timeout=10)
                 .json()["openInterest"]
             )
-            # 1h historical for delta
             hist = requests.get(
                 f"https://fapi.binance.com/futures/data/openInterestHist"
                 f"?symbol={symbol}&period=1h&limit=2",
                 timeout=10,
             ).json()
+            chg_pct = None
             if len(hist) >= 2:
                 oi_prev   = float(hist[0]["sumOpenInterest"])
                 oi_curr_h = float(hist[1]["sumOpenInterest"])
                 chg_pct   = ((oi_curr_h - oi_prev) / oi_prev) * 100 if oi_prev else None
-            else:
-                chg_pct = None
 
-            # Mark price to convert contracts → USD
-            mark  = float(
+            mark   = float(
                 requests.get(f"https://fapi.binance.com/fapi/v1/premiumIndex?symbol={symbol}", timeout=10)
                 .json()["markPrice"]
             )
-            oi_usd = oi_now * mark
-            results[label] = {"oi_usd": oi_usd, "oi_change_pct": chg_pct}
+            results[label] = {"oi_usd": oi_now * mark, "oi_change_pct": chg_pct}
         except Exception:
             pass
     return results
 
 
-# ── MACRO ─────────────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# MACRO / CALENDAR / NEWS / POLYMARKET
+# ══════════════════════════════════════════════════════════════════════════════
+
 def get_fred_latest(series_id):
     url = (
         f"https://api.stlouisfed.org/fred/series/observations?series_id={series_id}"
@@ -206,11 +504,10 @@ def get_fred_latest(series_id):
 
 
 def get_all_macro():
-    results = {}
-    for series_id, label in FRED_SERIES.items():
-        val, date, prev = get_fred_latest(series_id)
-        results[label] = {"value": val, "date": date, "prev": prev}
-    return results
+    return {
+        label: dict(zip(("value", "date", "prev"), get_fred_latest(sid)))
+        for sid, label in FRED_SERIES.items()
+    }
 
 
 def was_released_today(date_str):
@@ -222,15 +519,12 @@ def was_released_today(date_str):
         return False
 
 
-# ── CALENDAR ──────────────────────────────────────────────────────────────────
 def get_weekly_calendar():
-    """Returns (by_day_dict, today_events_list). today_events is fed to AI to prevent hallucination."""
     try:
         r         = requests.get("https://nfs.faireconomy.media/ff_calendar_thisweek.json", timeout=10).json()
         by_day    = {}
         today_str = datetime.now().strftime("%Y-%m-%d")
         today_ev  = []
-
         for e in r:
             if e.get("country", "").upper() != "USD":
                 continue
@@ -242,24 +536,18 @@ def get_weekly_calendar():
                 day_key    = datetime.strptime(event_date, "%Y-%m-%d").strftime("%a %d %b")
             except Exception:
                 continue
-
             badge  = " 🔴" if impact == "high" else " 🟡"
             detail = ""
             if e.get("forecast"): detail += f"  Fcst: {e['forecast']}"
             if e.get("previous"): detail += f"  Prev: {e['previous']}"
-
-            entry = e.get("title", "Unknown") + badge + detail
-            by_day.setdefault(day_key, []).append(entry)
-
+            by_day.setdefault(day_key, []).append(e.get("title", "Unknown") + badge + detail)
             if event_date == today_str:
                 today_ev.append(e.get("title", "Unknown") + detail)
-
         return by_day, today_ev
     except Exception:
         return {}, []
 
 
-# ── POLYMARKET ────────────────────────────────────────────────────────────────
 def get_polymarket_top():
     try:
         r       = requests.get("https://clob.polymarket.com/markets?active=true&closed=false", timeout=10).json()
@@ -282,7 +570,6 @@ def get_polymarket_top():
         return []
 
 
-# ── NEWS ──────────────────────────────────────────────────────────────────────
 def get_news(query, page_size=5):
     try:
         url = (
@@ -294,38 +581,39 @@ def get_news(query, page_size=5):
         return []
 
 
-# ── AI ANALYSIS ───────────────────────────────────────────────────────────────
-def get_groq_analysis(prices, fg_value, fg_label, macro,
-                      macro_news, crypto_news, poly,
-                      btc_dom, funding_rate, ls_ratio,
-                      today_events, markets, oi_data, eth_btc_ratio):
+# ══════════════════════════════════════════════════════════════════════════════
+# DAILY AI ANALYSIS
+# ══════════════════════════════════════════════════════════════════════════════
 
-    # Crypto prices block
+def build_raw_data_str(prices, fg_value, fg_label, macro, macro_news, crypto_news,
+                       poly, btc_dom, funding_rate, ls_ratio, markets, oi_data,
+                       eth_btc_ratio, today_events):
+    """Assemble the raw data string used by both the thesis AI and the daily analysis AI."""
     price_lines = []
     for coin_id, symbol in CRYPTO_WATCHLIST.items():
         d  = prices.get(coin_id, {})
         p  = d.get("usd")
         c  = d.get("usd_24h_change")
-        cs = f"{c:+.2f}%" if c is not None else "N/A"
-        ps = f"${p:,.2f}" if p else "N/A"
-        price_lines.append(f"{symbol}: {ps} ({cs})")
+        price_lines.append(
+            f"{symbol}: {'$'+f'{p:,.2f}' if p else 'N/A'} "
+            f"({'N/A' if c is None else f'{c:+.2f}%'})"
+        )
     if eth_btc_ratio:
         price_lines.append(f"ETH/BTC Ratio: {eth_btc_ratio:.5f}")
 
-    # Global markets block
     market_lines = [
-        f"{label}: {d['price']:,.2f} ({d['change_pct']:+.2f}%)" if d["change_pct"] is not None
-        else f"{label}: {d['price']:,.2f}"
-        for label, d in markets.items()
+        f"{lbl}: {d['price']:,.2f} ({d['change_pct']:+.2f}%)" if d["change_pct"] is not None
+        else f"{lbl}: {d['price']:,.2f}"
+        for lbl, d in markets.items()
     ]
 
-    # OI block
-    oi_lines = []
-    for label, d in oi_data.items():
-        chg = f"{d['oi_change_pct']:+.2f}%" if d["oi_change_pct"] is not None else "N/A"
-        oi_lines.append(f"{label} OI: ${d['oi_usd']/1e9:.2f}B (1h chg: {chg})")
+    oi_lines = [
+        f"{lbl} OI: ${d['oi_usd']/1e9:.2f}B "
+        f"(1h chg: {d['oi_change_pct']:+.2f}%)" if d["oi_change_pct"] is not None
+        else f"{lbl} OI: ${d['oi_usd']/1e9:.2f}B"
+        for lbl, d in oi_data.items()
+    ]
 
-    # Macro block
     macro_lines = []
     for label, d in macro.items():
         val, date, prev = d["value"], d["date"], d["prev"]
@@ -336,6 +624,11 @@ def get_groq_analysis(prices, fg_value, fg_label, macro,
             except Exception:
                 macro_lines.append(f"{label}: {val} as of {date}")
 
+    extra_parts = []
+    if btc_dom      is not None: extra_parts.append(f"BTC Dominance: {btc_dom}%")
+    if funding_rate is not None: extra_parts.append(f"BTC Funding Rate: {funding_rate:.4f}%")
+    if ls_ratio     is not None: extra_parts.append(f"BTC Long/Short Ratio: {ls_ratio:.2f}")
+
     news_lines   = [f"- {a.get('title','')} ({a.get('source',{}).get('name','')})" for a in macro_news[:5]]
     crypto_lines = [f"- {a.get('title','')} ({a.get('source',{}).get('name','')})" for a in crypto_news[:5]]
     poly_lines   = [
@@ -343,22 +636,17 @@ def get_groq_analysis(prices, fg_value, fg_label, macro,
         for m in poly if m["yes_prob"]
     ] or ["No data"]
 
-    extra = ""
-    if btc_dom      is not None: extra += f"BTC Dominance: {btc_dom}%\n"
-    if funding_rate is not None: extra += f"BTC Funding Rate: {funding_rate:.4f}%\n"
-    if ls_ratio     is not None: extra += f"BTC Long/Short Ratio: {ls_ratio:.2f}\n"
-
     today_block = (
         "TODAY'S SCHEDULED US DATA RELEASES:\n" + "\n".join(f"- {e}" for e in today_events)
         if today_events else
         "TODAY'S SCHEDULED US DATA RELEASES: None scheduled today."
     )
 
-    raw_data = "\n\n".join(filter(None, [
+    return "\n\n".join(filter(None, [
         "CRYPTO PRICES (24h):\n"  + "\n".join(price_lines),
         "GLOBAL MARKETS:\n"        + "\n".join(market_lines),
         "OPEN INTEREST:\n"         + "\n".join(oi_lines) if oi_lines else "",
-        extra.strip(),
+        "\n".join(extra_parts)     if extra_parts else "",
         f"FEAR & GREED: {fg_value} - {fg_label}",
         "US MACRO (FRED):\n"       + "\n".join(macro_lines),
         "MACRO HEADLINES:\n"       + "\n".join(news_lines),
@@ -367,15 +655,31 @@ def get_groq_analysis(prices, fg_value, fg_label, macro,
         today_block,
     ]))
 
-    prompt = f"""You are a Lead Macro Analyst reporting directly to Stanley Druckenmiller.
 
+def get_groq_analysis(raw_data_str, today_events, thesis_data, today_score):
+    # Inject thesis context so daily analysis stays aligned with the weekly view
+    thesis_context = ""
+    if thesis_data:
+        thesis_context = f"""
+WEEKLY THESIS CONTEXT (set Monday):
+Direction: {thesis_data['conviction_direction']}  {thesis_data['conviction_score']}/10
+Thesis: {thesis_data['thesis']}
+Today's thesis status: {today_score.get('status', 'N/A') if today_score else 'N/A'}
+"""
+
+    today_block = (
+        "TODAY'S SCHEDULED US DATA RELEASES:\n" + "\n".join(f"- {e}" for e in today_events)
+        if today_events else
+        "TODAY'S SCHEDULED US DATA RELEASES: None scheduled today."
+    )
+
+    prompt = f"""You are a Lead Macro Analyst reporting directly to Stanley Druckenmiller.
+{thesis_context}
 CRITICAL RULES:
 1. For "TODAY DATA RELEASES TO WATCH" — reference ONLY events listed under \
-"TODAY'S SCHEDULED US DATA RELEASES" in the raw data. If none are listed, say \
-"No major US data releases scheduled today." Never invent events from memory.
-2. For KEY LEVELS — use actual prices from the raw data as anchors. \
-Round to clean levels (e.g. if BTC is $83,200, say "watch $85K / $80K"). Never fabricate prices.
-3. Be sharp, not verbose. No filler. Every sentence must earn its place.
+"TODAY'S SCHEDULED US DATA RELEASES". If none, say so. Never invent from memory.
+2. KEY LEVELS must be anchored to actual prices in the data. Round to clean levels. Never fabricate.
+3. Every sentence must earn its place. No filler.
 
 Output EXACTLY this structure — no extra headers or preamble:
 
@@ -401,10 +705,10 @@ DXY: [level that matters and why — one clause]
 
 WHAT CHANGES MY MIND: [The one data point, price level, or event that invalidates the thesis]
 
-TODAY DATA RELEASES TO WATCH: [ONLY from calendar data provided. If none, say so.]
+TODAY DATA RELEASES TO WATCH: [ONLY from calendar data. If none, say so clearly.]
 
 Raw data:
-{raw_data}
+{raw_data_str}
 
 Under 950 words. Think Druckenmiller, not CNBC."""
 
@@ -425,10 +729,13 @@ Under 950 words. Think Druckenmiller, not CNBC."""
         return f"AI analysis unavailable: {e}"
 
 
-# ── MESSAGE BUILDER ───────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# MESSAGE BUILDER
+# ══════════════════════════════════════════════════════════════════════════════
+
 def build_message(prices, fg_value, fg_label, macro, poly, calendar,
                   btc_dom, funding_rate, ls_ratio, ai_text,
-                  markets, oi_data, eth_btc_ratio):
+                  markets, oi_data, eth_btc_ratio, thesis_block_lines):
     now   = datetime.now().strftime("%A, %d %b %Y")
     lines = []
 
@@ -462,7 +769,7 @@ def build_message(prices, fg_value, fg_label, macro, poly, calendar,
     if sub_parts:
         lines.append("  " + "  ·  ".join(sub_parts))
 
-    # AI situational awareness bullets (shown here, stripped from AI section below)
+    # AI situational awareness bullets
     sent_bullets = []
     for keyword in ("Geopolitical:", "Technical:", "Macro Flow:"):
         for line in ai_text.split("\n"):
@@ -471,6 +778,10 @@ def build_message(prices, fg_value, fg_label, macro, poly, calendar,
                 break
     if sent_bullets:
         lines += [""] + sent_bullets
+    lines.append("")
+
+    # ── Weekly Thesis Tracker ─────────────────────────────────────────────────
+    lines += thesis_block_lines
     lines.append("")
 
     # ── Global Market Snapshot ────────────────────────────────────────────────
@@ -582,8 +893,6 @@ def build_message(prices, fg_value, fg_label, macro, poly, calendar,
 
     # ── Druckenmiller Analysis ────────────────────────────────────────────────
     lines += [DIVIDER, "🧠  <b>DRUCKENMILLER ANALYSIS</b>", ""]
-
-    # Strip situational bullets already shown in sentiment section above
     clean_ai, skip = [], False
     for line in ai_text.split("\n"):
         if any(k in line for k in ("Geopolitical:", "Technical:", "Macro Flow:")):
@@ -601,9 +910,12 @@ def build_message(prices, fg_value, fg_label, macro, poly, calendar,
     return "\n".join(lines)
 
 
-# ── MAIN ──────────────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# MAIN
+# ══════════════════════════════════════════════════════════════════════════════
+
 if __name__ == "__main__":
-    print("Fetching data...")
+    print("Fetching market data...")
     prices              = get_crypto_prices()
     markets             = get_market_snapshot()
     fg_value, fg_label  = get_fear_greed()
@@ -618,19 +930,27 @@ if __name__ == "__main__":
     oi_data             = get_open_interest()
     eth_btc_ratio       = get_eth_btc_ratio(prices)
 
-    print("Running AI analysis...")
-    ai_text = get_groq_analysis(
-        prices, fg_value, fg_label, macro,
-        macro_news, crypto_news, poly,
-        btc_dom, funding_rate, ls_ratio,
-        today_ev, markets, oi_data, eth_btc_ratio,
+    # Build shared raw data string (used by both thesis AI and daily AI)
+    raw_data_str = build_raw_data_str(
+        prices, fg_value, fg_label, macro, macro_news, crypto_news,
+        poly, btc_dom, funding_rate, ls_ratio, markets, oi_data,
+        eth_btc_ratio, today_ev,
     )
+
+    # Run thesis tracker (Monday = generate, Tue–Fri = score)
+    print("Running thesis tracker...")
+    thesis_data, today_score, thesis_block = run_thesis_tracker(raw_data_str, today_ev)
+
+    # Daily Druckenmiller analysis (thesis-aware)
+    print("Running daily AI analysis...")
+    ai_text = get_groq_analysis(raw_data_str, today_ev, thesis_data, today_score)
 
     print("Building message...")
     full_message = build_message(
         prices, fg_value, fg_label, macro, poly, calendar,
         btc_dom, funding_rate, ls_ratio, ai_text,
         markets, oi_data, eth_btc_ratio,
+        thesis_block,
     )
 
     print("Sending to Telegram...")
