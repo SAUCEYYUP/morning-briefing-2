@@ -2,7 +2,7 @@ name: Daily Morning Briefing
 
 on:
   schedule:
-    - cron: '0 23 * * *'
+    - cron: '0 22 * * *'
   workflow_dispatch:
 
 jobs:
