@@ -304,4 +304,143 @@ def build_message(prices, fg_value, fg_label, macro, poly, calendar,
     if btc_dom:
         sub.append("BTC Dom: <b>" + str(btc_dom) + "%</b>")
     if funding_rate is not None:
-        fr_label = "Neutral" if abs(funding_rate) < 0.005 else ("Greed \u2191" if funding_rate > 0
+        if abs(funding_rate) < 0.005:
+            fr_label = "Neutral"
+        elif funding_rate > 0:
+            fr_label = "Greed"
+        else:
+            fr_label = "Fear"
+        sub.append("Funding: <b>" + "{:+.4f}".format(funding_rate) + "%</b> <i>(" + fr_label + ")</i>")
+    if ls_ratio is not None:
+        sub.append("L/S: <b>" + "{:.2f}".format(ls_ratio) + "</b>")
+    if sub:
+        lines.append("  " + "  \u00b7  ".join(sub))
+
+    sent_bullets = []
+    for keyword in ["Geopolitical:", "Technical:", "Macro Flow:"]:
+        for line in ai_text.split("\n"):
+            if keyword in line:
+                sent_bullets.append("  " + line.strip().lstrip("- ").lstrip("* "))
+                break
+    if sent_bullets:
+        lines.append(SPACE)
+        lines += sent_bullets
+    lines.append(SPACE)
+
+    lines += [DIV, "\U0001f4b0  <b>CRYPTO WATCHLIST</b>", SPACE]
+    for coin_id, symbol in CRYPTO_WATCHLIST.items():
+        d      = prices.get(coin_id, {})
+        price  = d.get("usd")
+        change = d.get("usd_24h_change")
+        mcap   = d.get("usd_market_cap")
+        ps = "${:,.2f}".format(price) if price else "N/A"
+        ms = "  <i>${:.1f}B</i>".format(mcap / 1e9) if mcap else ""
+        if change is not None:
+            arrow = "\u25b2" if change >= 0 else "\u25bc"
+            cs    = arrow + " {:.2f}%".format(abs(change))
+        else:
+            cs = "\u2014"
+        lines.append("  <b>" + symbol + "</b>   " + ps + "   " + cs + ms)
+    lines.append(SPACE)
+
+    lines += [DIV, "\U0001f4c9  <b>US MACRO DATA</b>", SPACE]
+    new_releases = []
+    for label, d in macro.items():
+        val  = d["value"]
+        date = d["date"]
+        prev = d["prev"]
+        if val is None or val == ".":
+            continue
+        try:
+            vf  = float(val)
+            pf  = float(prev) if prev and prev != "." else None
+            vs  = "{:,.2f}".format(vf)
+            chg = ""
+            if pf is not None:
+                diff  = vf - pf
+                arrow = "\u25b2" if diff > 0 else "\u25bc" if diff < 0 else "\u2192"
+                chg   = "  " + arrow + " <i>{:+.2f}</i>".format(diff)
+        except Exception:
+            vs  = str(val)
+            chg = ""
+        fresh = "\U0001f195 " if was_released_today(date) else ""
+        if was_released_today(date):
+            new_releases.append(label)
+        lines.append("  " + fresh + "<b>" + label + "</b>:  " + vs + chg + "  <i>(" + str(date) + ")</i>")
+
+    lines.append(SPACE)
+    if new_releases:
+        lines.append("\U0001f6a8  <b>Released today:</b> " + ", ".join(new_releases))
+    else:
+        lines.append("\u23f0  <i>No new US data releases today</i>")
+    lines.append(SPACE)
+
+    lines += [DIV, "\U0001f4c5  <b>ECONOMIC DOCKET \u2014 THIS WEEK</b>", SPACE]
+    if calendar:
+        for day, events in calendar.items():
+            lines.append("  <b>" + day + "</b>")
+            for ev in events[:4]:
+                lines.append("    \u2023 " + ev)
+            lines.append(SPACE)
+    else:
+        lines += ["  <i>Calendar unavailable</i>", SPACE]
+
+    lines += [DIV, "\U0001f3af  <b>POLYMARKET \u2014 TOP BY VOLUME</b>", SPACE]
+    if poly:
+        for m in poly:
+            vol = "${:.1f}M".format(m["volume"] / 1e6) if m["volume"] >= 1e6 else "${:,.0f}".format(m["volume"])
+            yes = "  <b>YES {:.0f}%</b>".format(m["yes_prob"]) if m["yes_prob"] else ""
+            lines.append("  \u2022 " + m["question"][:75] + yes + "  <i>" + vol + "</i>")
+    else:
+        lines.append("  <i>Could not load Polymarket data</i>")
+    lines.append(SPACE)
+
+    lines += [DIV, "\U0001f9e0  <b>DRUCKENMILLER ANALYSIS</b>", SPACE]
+    clean_ai = []
+    skip = False
+    for line in ai_text.split("\n"):
+        if any(k in line for k in ["Geopolitical:", "Technical:", "Macro Flow:"]):
+            skip = True
+        if line.strip().startswith("THEME:"):
+            skip = False
+        if not skip:
+            clean_ai.append(line)
+    lines.append("\n".join(clean_ai).strip())
+    lines.append(SPACE)
+
+    lines += [
+        DIV,
+        "\U0001f916  <i>CoinGecko \u00b7 Binance \u00b7 FRED \u00b7 Polymarket \u00b7 Groq AI</i>"
+    ]
+    return "\n".join(lines)
+
+
+if __name__ == "__main__":
+    print("Fetching data...")
+    prices             = get_crypto_prices()
+    fg_value, fg_label = get_fear_greed()
+    macro              = get_all_macro()
+    poly               = get_polymarket_top()
+    macro_news         = get_news("Federal Reserve OR CPI OR inflation OR GDP OR recession OR FOMC OR ISM PMI", 5)
+    crypto_news        = get_news("bitcoin OR ethereum OR crypto OR DeFi OR polymarket OR hyperliquid", 5)
+    calendar           = get_weekly_calendar()
+    btc_dom            = get_btc_dominance()
+    funding_rate       = get_btc_funding_rate()
+    ls_ratio           = get_btc_ls_ratio()
+
+    print("Running AI analysis...")
+    ai_text = get_groq_analysis(
+        prices, fg_value, fg_label, macro,
+        macro_news, crypto_news, poly,
+        btc_dom, funding_rate, ls_ratio
+    )
+
+    print("Building message...")
+    full_message = build_message(
+        prices, fg_value, fg_label, macro, poly, calendar,
+        btc_dom, funding_rate, ls_ratio, ai_text
+    )
+
+    print("Sending to Telegram...")
+    send_telegram(full_message)
+    print("Done!")
